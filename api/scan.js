@@ -1,0 +1,88 @@
+// Lee una boleta con Claude. La clave de API vive solo en el servidor,
+// nunca llega al navegador.
+
+const PROMPT = `Eres un lector de boletas y cuentas de restaurante. Devuelve SOLO un objeto JSON válido, sin markdown, sin explicaciones.
+
+Formato exacto:
+{"comercio":"","fecha":"YYYY-MM-DD","moneda":"CLP|ARS|USD","items":[{"nombre":"","monto":0}],"propina":0,"impuesto":0,"total":0}
+
+FORMATO DE NÚMEROS (crítico):
+- Muchas boletas de Argentina y Chile usan el punto como separador de miles y la coma como decimal.
+- "$154.900,00" son ciento cincuenta y cuatro mil novecientos: devuelve 154900.
+- "$9500,00" son nueve mil quinientos: devuelve 9500.
+- Nunca devuelvas separadores de miles ni símbolos. Solo el número.
+
+ESTRUCTURA DE LAS LÍNEAS:
+- Es habitual que el nombre esté en una línea y justo debajo aparezca la cantidad y el precio unitario, con el monto de la línea alineado a la derecha (ejemplo: "Cerveza Vaso" / "3.0 x $6600,00" ........ "$19800,00").
+- En ese caso el "monto" del item es SIEMPRE el total de la línea (19800), nunca el precio unitario (6600).
+- Pon la cantidad al principio del nombre: "3 Cerveza Vaso".
+- Si un nombre no tiene ningún monto asociado, ignóralo por completo.
+- Dos líneas con el mismo producto son dos items separados, no los sumes.
+
+VERIFICACIÓN OBLIGATORIA:
+- Antes de responder, suma todos los "monto" de items más propina más impuesto.
+- Ese resultado debe ser igual al TOTAL impreso en la boleta.
+- Si no coincide, vuelve a mirar la imagen y corrige antes de responder.
+
+OTRAS REGLAS:
+- "propina" es propina o servicio, "impuesto" es IVA u otros cargos que aparezcan separados del subtotal. Si no aparecen, 0.
+- Nunca incluyas propina ni impuesto dentro de items.
+- Moneda: infiere por el contexto. "Peso Argentino" o CABA es ARS. Si no puedes determinarla, usa "CLP".
+- Si la fecha no aparece, usa "".`;
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).send("Solo POST");
+  }
+
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    return res.status(503).send("Falta configurar ANTHROPIC_API_KEY en Vercel");
+  }
+
+  const image = req.body && req.body.image;
+  if (typeof image !== "string" || image.length < 100) {
+    return res.status(400).send("Imagen inválida");
+  }
+  // ~6 MB de base64 como techo, para que nadie abuse del endpoint
+  if (image.length > 8_000_000) {
+    return res.status(413).send("Imagen demasiado grande");
+  }
+
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 2000,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: { type: "base64", media_type: "image/jpeg", data: image },
+              },
+              { type: "text", text: PROMPT },
+            ],
+          },
+        ],
+      }),
+    });
+
+    if (!r.ok) {
+      const detail = await r.text();
+      return res.status(502).send("La API respondió " + r.status + ": " + detail.slice(0, 300));
+    }
+
+    const data = await r.json();
+    return res.status(200).json(data);
+  } catch (e) {
+    return res.status(500).send("Error al contactar la API: " + (e.message || "desconocido"));
+  }
+}
